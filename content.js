@@ -2,8 +2,11 @@
  * BS Closer — content script
  *
  * Runs on every page (and every frame) and:
+ *   0. Starts DuckDuckGo's autoconsent rule set (vendor/autoconsent), which
+ *      opts out of hundreds of known consent platforms.
  *   1. Rejects cookie consent via framework-specific selectors (OneTrust,
  *      Cookiebot, Usercentrics, TrustArc, Didomi), falling back to text matching.
+ *      Banners that only say "OK" / "Got it" are acknowledged.
  *   2. Dismisses newsletter / survey / marketing / app-download / notification
  *      popups by clicking their close or "no thanks" buttons.
  *   3. Hides leftover overlays and restores page scrolling.
@@ -33,12 +36,30 @@
     // a last resort (the banner then stays away on future visits).
     ACCEPT_AS_LAST_RESORT: false,
 
+    // "Notice" banners offer no choice, only "OK" / "Got it" (maybe plus an ×).
+    // Clicking it changes nothing about what the site does, and the banner stops
+    // coming back on every visit, so it is clicked instead of hidden.
+    ACKNOWLEDGE_NOTICE_BANNERS: true,
+    // Also treat a banner whose only button is "Accept" as a notice. Off by default:
+    // unlike "OK", the label says you consent, and some sites act on it.
+    ACKNOWLEDGE_LONE_ACCEPT: false,
+
+    // DuckDuckGo autoconsent (vendor/autoconsent) runs first; BS Closer's own consent
+    // handling below is the fallback for banners its rules don't cover.
+    AUTOCONSENT_ENABLED: true,
+    // DuckDuckGo's heuristic for unknown banners: 'off', 'reject', 'tier1' (also clicks
+    // "OK"-style buttons) or 'tier2' (also accepts). With 'off', unknown banners are
+    // left to BS Closer's generic logic and its safety rules.
+    AUTOCONSENT_HEURISTIC_MODE: 'off',
+
     MIN_SCAN_INTERVAL_MS: 700, // throttle between DOM scans
     RECHECK_DELAY_MS: 800, // follow-up scan while waiting on a banner
     HIDE_DELAY_MS: 1500, // a container must be visible this long before we hide it (lets buttons render)
     RETRY_DELAY_MS: 1500, // after a click, wait this long before hiding a container that is still visible
     USER_INTERACTION_WINDOW_MS: 2000, // popups appearing this soon after a user click are user-initiated → left alone
     SCROLL_RESTORE_WINDOW_MS: 10000, // only restore scrolling shortly after we acted
+    AUTOCONSENT_GRACE_MS: 1500, // a consent banner autoconsent hasn't claimed by then is handled by BS Closer
+    AUTOCONSENT_MAX_WAIT_MS: 10000, // stop waiting on an autoconsent opt-out that never reports back
     MAX_ACTIONS_PER_PAGE: 40, // safety budget: stop if a page keeps respawning popups
     MAX_LABEL_LENGTH: 60, // longer button labels are never matched
     LABEL_SLACK: 25, // "Reject all cookies" matches "reject" if the extra text is ≤ this many chars
@@ -69,6 +90,14 @@
     ACCEPT_KEYWORDS: [
       'Accept', 'Accept All', 'Accept Cookies', 'Allow All', 'Agree', 'I Agree', 'OK', 'Got It',
       'Aceitar', 'Aceitar Todos', 'Aceitar Cookies', 'Aceito', 'Concordo', 'Permitir Todos', 'Entendi',
+    ],
+
+    /* ---------- Notice-banner "acknowledge" labels (exact match; see ACKNOWLEDGE_NOTICE_BANNERS) ---------- */
+    ACKNOWLEDGE_KEYWORDS: [
+      'OK', 'Okay', 'OK Got It', 'Got It', 'I Got It', 'Understood', 'I Understand', 'Continue',
+      'Close', 'Dismiss',
+      'Entendi', 'OK Entendi', 'Entendido', 'Ciente', 'Estou Ciente', 'Tudo Bem', 'Continuar',
+      'Prosseguir', 'Fechar',
     ],
 
     /* ---------- Popup close / dismiss labels ---------- */
@@ -300,6 +329,11 @@
     accept: normalizeList(CONFIG.ACCEPT_KEYWORDS),
     close: normalizeList(CONFIG.CLOSE_KEYWORDS),
   };
+  // Acknowledge labels must match exactly: "Continue with all cookies" is not an acknowledgment.
+  const ACK_LABELS = new Set([
+    ...normalizeList(CONFIG.ACKNOWLEDGE_KEYWORDS),
+    ...(CONFIG.ACKNOWLEDGE_LONE_ACCEPT ? KW.accept : []),
+  ]);
   const DANGER_RE = buildPhraseRegex(CONFIG.DANGEROUS_KEYWORDS);
   const ANNOYANCE_RE = buildPhraseRegex(CONFIG.ANNOYANCE_KEYWORDS);
   const CONSENT_TEXT_RE = buildPhraseRegex(CONFIG.CONSENT_TEXT_KEYWORDS);
@@ -487,6 +521,12 @@
    * CLICK SAFETY
    * ======================================================================== */
 
+  /** A link that navigates somewhere (anything but "#" or javascript:). */
+  function isRealLink(el) {
+    const href = (el.getAttribute('href') || '').trim();
+    return !!href && !href.startsWith('#') && !/^javascript:/i.test(href);
+  }
+
   /** All the rules an element must pass before we click it. */
   function isSafeToClick(el, { allowHidden = false } = {}) {
     if (!el || clickedElements.has(el)) return false;
@@ -502,10 +542,7 @@
     if (el.tagName === 'BUTTON' && el.form && el.type === 'submit') return false;
 
     // Never follow real links (only "#" or javascript: pseudo-links are allowed).
-    if (el.tagName === 'A') {
-      const href = (el.getAttribute('href') || '').trim();
-      if (href && !href.startsWith('#') && !/^javascript:/i.test(href)) return false;
-    }
+    if (el.tagName === 'A' && isRealLink(el)) return false;
 
     // Never click purchase / subscribe / delete / account / confirm-style buttons.
     const fullLabel = normalize(labelSources(el).filter(Boolean).join(' ').slice(0, 300));
@@ -594,6 +631,135 @@
     return null;
   }
 
+  /**
+   * "OK" / "Got it" button of a notice banner: one where every control only acknowledges
+   * it (text from ACKNOWLEDGE_KEYWORDS, or an × icon). Any other control, such as
+   * Accept + Settings, means the banner offers a real choice, and null is returned.
+   * Like everywhere else in consent banners, the × itself is never clicked.
+   */
+  function findAcknowledgeButton(banner) {
+    const controls = new Set();
+    for (const el of banner.querySelectorAll(ALL_CLICKABLE)) {
+      if (!isVisible(el)) continue;
+      const control = resolveClickable(el, banner);
+      if (control.tagName === 'A' && isRealLink(control)) continue; // "Privacy policy" and similar links
+      controls.add(control);
+    }
+    // Keep the innermost controls (drops e.g. a focusable <div> wrapped around the buttons).
+    const buttons = [...controls].filter((c) => ![...controls].some((o) => o !== c && c.contains(o)));
+    if (buttons.length > 4) return null;
+
+    let target = null;
+    for (const el of buttons) {
+      const text = (el.textContent || '').trim();
+      if (labelSources(el).some((src) => ACK_LABELS.has(normalize(src)))) target = target || el;
+      else if (!(CLOSE_GLYPHS.has(text.toLowerCase()) || (!text && el.matches(CLOSE_SELECTOR)))) return null;
+    }
+    return target && isSafeToClick(target) ? { el: target, how: `text "${normalize(target.textContent)}"` } : null;
+  }
+
+  /* ==========================================================================
+   * STEP 0 — DUCKDUCKGO AUTOCONSENT
+   * DuckDuckGo's rule set (vendor/autoconsent, MPL-2.0) covers hundreds of
+   * consent platforms, including multi-step opt-outs. It runs on its own
+   * schedule; steps 1 and 3 hold off on consent banners while it is still
+   * detecting or is opting out, and take over if it fails or finds nothing.
+   * ======================================================================== */
+  const AUTOCONSENT_DETECTING = new Set(['loading', 'initialized', 'started', 'cmpDetected']);
+  const EVAL_EVENT = 'bs-closer:autoconsent-eval';
+  const EVAL_RESULT_EVENT = 'bs-closer:autoconsent-eval-result';
+  const autoconsent = { instance: null, lifecycle: '', busySince: 0, succeededAt: 0 };
+
+  function startAutoconsent() {
+    if (!CONFIG.AUTOCONSENT_ENABLED) return;
+    const lib = globalThis.BSCloserAutoconsent;
+    const rules = globalThis.BSCloserAutoconsentRules;
+    if (!lib || !rules) {
+      log('DuckDuckGo autoconsent files are missing; run scripts/update-autoconsent.mjs.');
+      return;
+    }
+    try {
+      // Configured after construction (as DuckDuckGo's standalone build does): passing the
+      // config to the constructor initializes before the library's DOM helpers exist.
+      autoconsent.instance = new lib.default(async (msg) => onAutoconsentMessage(msg));
+      autoconsent.instance.initialize(
+        {
+          autoAction: 'optOut',
+          heuristicMode: CONFIG.AUTOCONSENT_HEURISTIC_MODE,
+          enableHeuristicDetection: CONFIG.AUTOCONSENT_HEURISTIC_MODE !== 'off',
+          logs: { errors: false }, // errors arrive as messages and are logged below
+        },
+        { autoconsent: [], compact: lib.filterCompactRules(rules, { url: location.href, mainFrame: isTop }) },
+      );
+    } catch (err) {
+      log('DuckDuckGo autoconsent failed to start:', err);
+    }
+  }
+
+  function onAutoconsentMessage(msg) {
+    switch (msg.type) {
+      case 'eval': {
+        const result = evalInPage(msg.id, msg.snippetId);
+        // Reply asynchronously: the library registers the request only after sending it.
+        Promise.resolve().then(() => autoconsent.instance.receiveMessageCallback({ type: 'evalResp', id: msg.id, result }));
+        break;
+      }
+      case 'report':
+        autoconsent.lifecycle = msg.state.lifecycle;
+        break;
+      case 'cmpDetected':
+        log(`DuckDuckGo rules: ${msg.cmp} detected.`);
+        break;
+      case 'popupFound':
+        autoconsent.busySince = Date.now();
+        log(`DuckDuckGo rules: ${msg.cmp} banner found, opting out.`);
+        break;
+      case 'optOutResult':
+        autoconsent.busySince = 0;
+        if (msg.result) {
+          autoconsent.succeededAt = lastActionAt = Date.now(); // lastActionAt lets restoreScroll run
+          log(`DuckDuckGo rules: ${msg.cmp} opt-out succeeded.`);
+        } else {
+          log(`DuckDuckGo rules: ${msg.cmp} opt-out failed, BS Closer takes over.`);
+        }
+        scheduleScan();
+        break;
+      case 'autoconsentDone':
+        log(`DuckDuckGo rules: ${msg.cmp} done (${msg.isCosmetic ? 'banner hidden' : `${msg.totalClicks} clicks`}, ${msg.duration} ms).`);
+        break;
+      case 'autoconsentError':
+        log('DuckDuckGo rules error:', msg.details);
+        break;
+    }
+  }
+
+  /**
+   * Run one of autoconsent's fixed snippets in the page's own world, where CMP APIs
+   * live (see vendor/autoconsent/eval-bridge.js). DOM events are dispatched
+   * synchronously across worlds, so the result is available on return.
+   */
+  function evalInPage(id, snippetId) {
+    let result = false;
+    const onResult = (e) => {
+      try {
+        const reply = JSON.parse(e.detail);
+        if (reply.id === id) result = reply.result === true;
+      } catch { /* not ours */ }
+    };
+    document.addEventListener(EVAL_RESULT_EVENT, onResult);
+    document.dispatchEvent(new CustomEvent(EVAL_EVENT, { detail: JSON.stringify({ id, snippetId }) }));
+    document.removeEventListener(EVAL_RESULT_EVENT, onResult);
+    return result;
+  }
+
+  /** Should a consent banner first seen at `firstSeen` be left to autoconsent for now? */
+  function waitForAutoconsent(firstSeen, now) {
+    if (!autoconsent.instance) return false;
+    if (autoconsent.busySince) return now - autoconsent.busySince < CONFIG.AUTOCONSENT_MAX_WAIT_MS;
+    if (now - autoconsent.succeededAt < CONFIG.RETRY_DELAY_MS) return true; // give the banner time to close
+    return AUTOCONSENT_DETECTING.has(autoconsent.lifecycle) && now - firstSeen < CONFIG.AUTOCONSENT_GRACE_MS;
+  }
+
   /* ==========================================================================
    * STEP 1 — FRAMEWORK-SPECIFIC CONSENT HANDLING
    * ======================================================================== */
@@ -649,6 +815,11 @@
         continue;
       }
 
+      if (waitForAutoconsent(state.firstSeen, now)) {
+        needRecheck = true;
+        continue;
+      }
+
       // a) Framework-specific reject selectors.
       let found = null;
       for (const root of roots) {
@@ -676,10 +847,20 @@
         continue;
       }
 
-      // c) No reject option (yet). Wait for buttons to render, then accept (if enabled) or hide.
+      // c) No reject option (yet). Wait for buttons to render, then acknowledge a notice,
+      //    accept (if enabled) or hide.
       if (now - state.firstSeen < CONFIG.HIDE_DELAY_MS) {
         needRecheck = true;
         continue;
+      }
+      if (CONFIG.ACKNOWLEDGE_NOTICE_BANNERS) {
+        const ack = banners.map((b) => findAcknowledgeButton(b)).find(Boolean);
+        if (ack) {
+          clickElement(ack.el, `${fw.name} notice acknowledged via ${ack.how}`);
+          state.clickedAt = now;
+          needRecheck = true;
+          continue;
+        }
       }
       if (CONFIG.ACCEPT_AS_LAST_RESORT) {
         const accept = banners.map((b) => findByText(b, KW.accept)).find(Boolean);
@@ -773,6 +954,11 @@
       return;
     }
 
+    if (waitForAutoconsent(info.firstSeen, now)) {
+      needRecheck = true;
+      return;
+    }
+
     const reject = findByText(el, KW.reject);
     if (reject) {
       clickElement(reject.el, `cookie reject via ${reject.how}`);
@@ -784,6 +970,15 @@
     if (now - info.firstSeen < CONFIG.HIDE_DELAY_MS) {
       needRecheck = true;
       return;
+    }
+    if (CONFIG.ACKNOWLEDGE_NOTICE_BANNERS) {
+      const ack = findAcknowledgeButton(el);
+      if (ack) {
+        clickElement(ack.el, `cookie notice acknowledged via ${ack.how}`);
+        info.clickedAt = now;
+        needRecheck = true;
+        return;
+      }
     }
     if (CONFIG.ACCEPT_AS_LAST_RESORT) {
       const accept = findByText(el, KW.accept);
@@ -911,6 +1106,7 @@
     return;
   }
   if (isTop) log('Active.');
+  startAutoconsent();
 
   // Track genuine user interaction so dialogs the user opens are left alone.
   // Programmatic clicks (including ours) have isTrusted === false.
