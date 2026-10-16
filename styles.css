@@ -1,0 +1,26 @@
+/*
+ * BS Closer — injected styles.
+ *
+ * content.js marks elements with data attributes instead of removing them from
+ * the DOM. Hiding is safer than removal: frameworks like React/Vue can crash
+ * when nodes they own disappear, and hidden nodes keep the page's own scripts
+ * working if they look the banner up later.
+ */
+
+/* Banners, popups and overlays hidden by the extension. */
+[data-bs-closer-hidden] {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+/* Scroll restored on <html>/<body> after a popup locked it (overflow: hidden). */
+html[data-bs-closer-scroll],
+body[data-bs-closer-scroll] {
+  overflow-y: auto !important;
+}
+
+/* Undo the "position: fixed on body" scroll-lock technique. */
+body[data-bs-closer-unfixed] {
+  position: static !important;
+}

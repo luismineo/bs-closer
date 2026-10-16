@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "BS Closer",
+  "version": "1.0.0",
+  "description": "Automatically rejects cookies and dismisses consent banners, newsletter popups, marketing overlays and other annoyances.",
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
