@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>Late promo bar</title>
+<style>
+  .css-pb5 { position: fixed; top: 0; left: 0; right: 0; height: 40px; z-index: 1100; background: #ffd60a; text-align: center; line-height: 40px; }
+</style>
+<body><h1>Article</h1>
+<script src="fill.js"></script>
+<script>
+  popupLater(`
+    <div class="css-pb5">
+      Free shipping today only! Use promo code SHIP at checkout.
+      <button data-close aria-label="Dismiss">×</button>
+    </div>`);
+</script>

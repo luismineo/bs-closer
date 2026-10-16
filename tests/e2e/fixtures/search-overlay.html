@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>Search overlay</title>
+<style>
+  .css-se8u { position: fixed; inset: 0; z-index: 5000; background: rgba(255, 255, 255, .95); display: flex; align-items: center; justify-content: center; }
+  .css-se8u > div { width: 60vw; padding: 24px; }
+</style>
+<body><h1>Article</h1>
+<script src="fill.js"></script>
+<script>
+  popupLater(`
+    <div class="css-se8u"><div>
+      <input type="search" placeholder="Search the site"> <button data-close>×</button>
+      <p>Popular: shoes, jackets</p>
+    </div></div>`);
+</script>

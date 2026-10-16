@@ -1,0 +1,15 @@
+<!doctype html><meta charset="utf-8"><title>Chat bubble</title>
+<style>
+  .css-ln2 { position: fixed; right: 20px; bottom: 20px; width: 56px; height: 56px; border-radius: 50%; border: 0; background: #0a84ff; z-index: 2147483000; }
+  .css-tz4 { position: fixed; right: 20px; bottom: 90px; width: 280px; padding: 16px; background: #fff; box-shadow: 0 2px 12px #0004; z-index: 2147483000; }
+</style>
+<body><h1>Article</h1>
+<button class="css-ln2" aria-label="Open chat"><svg width="24" height="24"><circle cx="12" cy="12" r="10" fill="#fff"/></svg></button>
+<script src="fill.js"></script>
+<script>
+  popupLater(`
+    <div class="css-tz4">
+      <button data-close aria-label="Close">×</button>
+      <p>Hi there! How can we help you today?</p>
+    </div>`);
+</script>

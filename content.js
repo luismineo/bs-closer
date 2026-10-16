@@ -10,6 +10,8 @@
  *   2. Dismisses newsletter / survey / marketing / app-download / notification
  *      popups by clicking their close or "no thanks" buttons.
  *   3. Hides leftover overlays and restores page scrolling.
+ *   3b. Scores unnamed floating elements (CSS-in-JS popups) by behaviour and
+ *      position, and closes high scorers (logs only, by default).
  *   4. Keeps watching dynamic content with a throttled MutationObserver.
  *
  * Safety first: it never submits forms, never touches login/payment forms,
@@ -52,6 +54,35 @@
     // left to BS Closer's generic logic and its safety rules.
     AUTOCONSENT_HEURISTIC_MODE: 'off',
 
+    // Heuristic for popups whose names give nothing away (top frame only, see step 3b):
+    // floating elements are scored by how they behave and where they sit.
+    // 'off', 'log' (score and log, never act; the default while weights are tuned) or 'act'.
+    HEURISTIC_MODE: 'log',
+    HEURISTIC_ACT_SCORE: 7, // close or hide at this score or above
+    HEURISTIC_LOG_SCORE: 4, // in 'act' mode, lower scores aren't logged ('log' mode logs everything)
+    // Per-site act score for a host or any subdomain of it, e.g. { 'example.com': 9 }.
+    // A high value such as 99 keeps the heuristic from acting on that site.
+    HEURISTIC_SITE_SCORES: {},
+    HEURISTIC_WEIGHTS: {
+      late: 2, // appeared after the page loaded
+      trigger: 2, // appeared 3–30 s after load, or just after a deep scroll or exit intent
+      backdrop: 2, // semi-transparent full-viewport backdrop next to or inside it
+      scrollLock: 2, // page scrolling got locked when it appeared
+      zIndex: 1, // z-index ≥ 1000
+      placement: 1, // centred modal, or docked to a corner or the bottom (top too when late)
+      emailInput: 2, // email capture
+      closeButton: 1, // has a close / "no thanks" control
+      annoyanceText: 2, // text matches ANNOYANCE_KEYWORDS
+      vendor: 3, // script or iframe from POPUP_VENDOR_HOSTS inside it
+      vendorOnPage: 1, // ...or anywhere on the page
+      siteChrome: -4, // is, is inside or holds header / nav / footer
+      content: -3, // more than 8 links or 600 characters: real content or a menu
+      media: -3, // video/audio player or slider
+      otherInputs: -5, // search, password, address… inputs: search overlays, forms
+      initialTopBar: -3, // present at load and docked to the top: part of the layout
+      liveRegion: -2, // role=status / alert / aria-live: toasts the user may need
+    },
+
     MIN_SCAN_INTERVAL_MS: 700, // throttle between DOM scans
     RECHECK_DELAY_MS: 800, // follow-up scan while waiting on a banner
     HIDE_DELAY_MS: 1500, // a container must be visible this long before we hide it (lets buttons render)
@@ -60,6 +91,7 @@
     SCROLL_RESTORE_WINDOW_MS: 10000, // only restore scrolling shortly after we acted
     AUTOCONSENT_GRACE_MS: 1500, // a consent banner autoconsent hasn't claimed by then is handled by BS Closer
     AUTOCONSENT_MAX_WAIT_MS: 10000, // stop waiting on an autoconsent opt-out that never reports back
+    HEURISTIC_TRIGGER_WINDOW_MS: 3000, // a popup this soon after a deep scroll, exit intent or scroll lock was caused by it
     MAX_ACTIONS_PER_PAGE: 40, // safety budget: stop if a page keeps respawning popups
     MAX_LABEL_LENGTH: 60, // longer button labels are never matched
     LABEL_SLACK: 25, // "Reject all cookies" matches "reject" if the extra text is ≤ this many chars
@@ -143,14 +175,14 @@
     ANNOYANCE_KEYWORDS: [
       // English
       'newsletter', 'subscribe', 'sign up', 'signup', 'email', 'e mail', 'your inbox', 'discount',
-      'coupon', 'promo code', '% off', 'off your first', 'offer', 'deal', 'survey', 'feedback',
+      'coupon', 'promo code', '% off', 'off your first', 'offer', 'deal', 'free shipping', 'survey', 'feedback',
       'quick question', 'download the app', 'get the app', 'open in app', 'open the app',
       'use the app', 'app store', 'google play', 'notifications', 'push notifications',
       'allow notifications', 'stay updated', 'stay in the loop', 'join our', 'join now',
       'chat with us', 'how can we help', 'can we help', 'need help', 'cookie', 'cookies', 'consent',
       // Português (BR)
       'inscreva se', 'inscreva', 'assine', 'cadastre se', 'cadastre', 'receba', 'ofertas', 'oferta',
-      'desconto', 'cupom', 'promoção', 'pesquisa', 'avalie', 'sua opinião', 'baixe o app',
+      'desconto', 'cupom', 'promoção', 'frete grátis', 'pesquisa', 'avalie', 'sua opinião', 'baixe o app',
       'baixe nosso app', 'baixar o app', 'aplicativo', 'notificações', 'ative as notificações',
       'novidades', 'fale conosco', 'posso ajudar', 'como podemos ajudar', 'privacidade', 'lgpd',
     ],
@@ -190,6 +222,13 @@
       'iframe[name="intercom-borderless-frame"]', // Intercom welcome-message bubble
       'iframe[name="intercom-notifications-frame"]',
       '#onesignal-bell-container',
+    ],
+
+    // Popup vendors (script src or iframe host, any subdomain): a strong heuristic signal.
+    POPUP_VENDOR_HOSTS: [
+      'klaviyo.com', 'privy.com', 'omappapi.com', 'sumo.com', 'justuno.com', 'wisepops.com',
+      'popt.in', 'hsforms.net', 'hscta.net', 'hotjar.com', 'sleeknote.com', 'wheelio-app.com',
+      'optimonk.com',
     ],
 
     /* ---------- Classes sites add to <html>/<body> to lock scrolling ---------- */
@@ -1025,6 +1064,303 @@
   }
 
   /* ==========================================================================
+   * STEP 3b — HEURISTIC ANNOYANCES (top frame only)
+   * Popups built with CSS-in-JS have no telling class names, so this step
+   * finds floating elements by where they sit (a few elementsFromPoint probes,
+   * plus fixed elements newly added to <body>) and scores them on how they
+   * behave, using HEURISTIC_WEIGHTS. Runs after step 3 and skips anything it
+   * or the consent logic handles. Scores are cached until the subtree mutates.
+   * ======================================================================== */
+  const heuristicOn = isTop && CONFIG.HEURISTIC_MODE !== 'off';
+  const heuristicActs = CONFIG.HEURISTIC_MODE === 'act';
+  const W = CONFIG.HEURISTIC_WEIGHTS;
+  const INITIAL_WINDOW_MS = 1000; // seen this soon after start = part of the first snapshot (covers SPA hydration)
+  const EDGE_PX = 24; // "docked" = this close to a viewport edge
+  const SITE_CHROME_SELECTOR = 'header, nav, footer, [role="banner"], [role="navigation"], [role="contentinfo"]';
+  const EMAIL_INPUT_SELECTOR = 'input[type="email"], input[autocomplete="email"]';
+  const MEDIA_SELECTOR = 'video[controls], audio[controls], [role="slider"], [class*="player" i]';
+  const OTHER_INPUT_SELECTOR = [
+    'input[type="search"]', '[role="search"]', 'input[name="q"]', 'input[name*="search" i]',
+    'input[placeholder*="search" i]', 'input[placeholder*="buscar" i]', 'input[placeholder*="pesquis" i]',
+    'input[type="password"]', 'input[autocomplete*="address"]', 'input[autocomplete="postal-code"]',
+    'input[type="date"]', 'input[type="file"]',
+  ].join(', ');
+  const LIVE_REGION_SELECTOR = '[role="status"], [role="alert"], [aria-live]:not([aria-live="off"])';
+
+  const heuristicInfo = new WeakMap(); // candidate → { firstSeen, initial, userInitiated, dirty, skip, score, signals, backdrop, loggedScore, clickedAt }
+  const tracked = new Set(); // candidates on screen; a mutation inside one marks it for re-scoring
+  const addedToBody = new Set(); // <body> children added since the last scan (portals)
+  const heuristic = {
+    startedAt: Date.now(), locked: false, lockedSince: 0,
+    pastScrollMark: false, scrollTriggerAt: 0, exitIntentAt: 0, vendorOnPage: false, vendorCheckedAt: 0,
+  };
+  const actScore = (() => {
+    const host = location.hostname.toLowerCase();
+    const site = Object.keys(CONFIG.HEURISTIC_SITE_SCORES).find((d) => host === d || host.endsWith('.' + d));
+    return site ? CONFIG.HEURISTIC_SITE_SCORES[site] : CONFIG.HEURISTIC_ACT_SCORE;
+  })();
+
+  /** MutationObserver hook: remember new <body> children and mark mutated candidates dirty. */
+  function trackMutations(records) {
+    for (const r of records) {
+      if (r.target === document.body) {
+        for (const n of r.addedNodes) if (n.nodeType === 1) addedToBody.add(n);
+      }
+      for (const el of tracked) {
+        const info = heuristicInfo.get(el);
+        if (!info.dirty && el.contains(r.target)) info.dirty = true;
+      }
+    }
+  }
+
+  function onScrollDepth() {
+    const max = document.documentElement.scrollHeight - window.innerHeight;
+    const past = max > 0 && window.scrollY / max >= 0.4;
+    if (past && !heuristic.pastScrollMark) heuristic.scrollTriggerAt = Date.now();
+    heuristic.pastScrollMark = past;
+  }
+
+  function onMouseOut(e) {
+    if (!e.relatedTarget && e.clientY <= 0) heuristic.exitIntentAt = Date.now(); // pointer left through the top
+  }
+
+  function updateScrollLock(now) {
+    const locked = [document.documentElement, document.body].some((el) => {
+      if (!el) return false;
+      if ([...el.classList].some((c) => SCROLL_LOCK_CLASSES.has(c.toLowerCase()))) return true;
+      const s = getComputedStyle(el);
+      return s.overflowY === 'hidden' || s.overflowY === 'clip' || (el === document.body && s.position === 'fixed');
+    });
+    if (locked === heuristic.locked) return;
+    heuristic.locked = locked;
+    if (locked) heuristic.lockedSince = now;
+    for (const el of tracked) heuristicInfo.get(el).dirty = true;
+  }
+
+  function isFloatingRoot(el) {
+    const s = getComputedStyle(el);
+    return s.position === 'fixed' || (s.position === 'sticky' && parseInt(s.zIndex, 10) >= 100);
+  }
+
+  /** Outermost fixed (or high-z sticky) ancestor of `node` below <body>, memoised per scan in `roots`. */
+  function floatingRootOf(node, roots) {
+    const chain = [];
+    let n = node;
+    for (; n && n !== document.body && n !== document.documentElement && !roots.has(n); n = n.parentElement) chain.push(n);
+    let root = n && roots.has(n) ? roots.get(n) : null;
+    for (let i = chain.length - 1; i >= 0; i--) {
+      if (!root && isFloatingRoot(chain[i])) root = chain[i];
+      roots.set(chain[i], root);
+    }
+    return roots.get(node) || null;
+  }
+
+  /** Floating elements at a few key viewport points, plus floating portals added to <body>. */
+  function findHeuristicCandidates() {
+    const found = new Set();
+    const roots = new Map();
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = document.documentElement.clientHeight || window.innerHeight;
+    const points = [[vw / 2, vh / 2], [vw / 2, vh - 30], [vw - 30, vh - 30], [vw / 2, 30], [30, vh / 2]];
+    for (const [x, y] of points) {
+      for (const hit of document.elementsFromPoint(x, y).slice(0, 6)) {
+        const root = floatingRootOf(hit, roots);
+        if (root) found.add(root);
+      }
+    }
+    for (const node of addedToBody) {
+      if (!node.isConnected) continue;
+      if (isFloatingRoot(node)) found.add(node);
+      else for (const child of [...node.children].slice(0, 5)) if (isFloatingRoot(child)) found.add(child);
+    }
+    addedToBody.clear();
+    return found;
+  }
+
+  /** Already handled (or protected) by another part of BS Closer, or by the user. */
+  function handledElsewhere(el, containers) {
+    if (el.closest(`[${HIDDEN_ATTR}], [data-bs-closer-ignore]`) || el.querySelector(`[${HIDDEN_ATTR}]`)) return true;
+    if (containerInfo.has(el) || containers.some((c) => c.el.contains(el) || el.contains(c.el))) return true;
+    if (el.closest(FRAMEWORK_CONTAINER_SELECTOR) || el.querySelector(FRAMEWORK_CONTAINER_SELECTOR)) return true;
+    for (const m of userModals) if (m.contains(el) || el.contains(m)) return true;
+    return false;
+  }
+
+  /** Never a heuristic target: login/payment UI, consent banners, or nothing to see (a bare backdrop). */
+  function notAnAnnoyance(el, text) {
+    if (el.querySelector(SENSITIVE_INPUT_SELECTOR)) return true;
+    if (el.matches(CONSENT_SELECTOR)) return true;
+    if (CONSENT_TEXT_RE.test(normalize(text.slice(0, 2000))) && !el.querySelector(EMAIL_INPUT_SELECTOR)) return true;
+    return !text.trim() && !el.querySelector('iframe, img, svg, video');
+  }
+
+  /** The visible box of a popup: the element, or for a full-screen wrapper the first box inside it. */
+  function layoutBox(el) {
+    if (viewportCoverage(el) < 0.9) return el;
+    let checked = 0;
+    for (const child of el.querySelectorAll(':scope > *, :scope > * > *, :scope > * > * > *')) {
+      if (++checked > 30) break;
+      const c = viewportCoverage(child);
+      if (c > 0.02 && c < 0.9 && isVisible(child)) return child;
+    }
+    return el;
+  }
+
+  function isBackdrop(el) {
+    if (viewportCoverage(el) < 0.9) return false;
+    const s = getComputedStyle(el);
+    const rgba = s.backgroundColor.match(/[\d.]+/g) || [];
+    const alpha = rgba.length >= 4 ? Number(rgba[3]) : rgba.length === 3 ? 1 : 0;
+    return (alpha > 0 && (alpha < 1 || Number(s.opacity) < 1)) || (s.backdropFilter || 'none') !== 'none';
+  }
+
+  /** Semi-transparent full-viewport backdrop: a sibling, the element itself, or a direct child. */
+  function findBackdrop(el) {
+    for (const sib of [el.previousElementSibling, el.nextElementSibling]) {
+      if (sib && !sib.hasAttribute(HIDDEN_ATTR) && isVisible(sib) && isBackdrop(sib)) return sib;
+    }
+    if (isBackdrop(el)) return el;
+    return [...el.children].slice(0, 5).find((c) => isVisible(c) && isBackdrop(c)) || null;
+  }
+
+  function isVendorUrl(url) {
+    try {
+      const host = new URL(url, location.href).hostname;
+      return CONFIG.POPUP_VENDOR_HOSTS.some((h) => host === h || host.endsWith('.' + h));
+    } catch {
+      return false;
+    }
+  }
+
+  const hasVendorSource = (scope) => [...scope.querySelectorAll('script[src], iframe[src]')].some((n) => isVendorUrl(n.src));
+
+  /** Vendor scripts load late, so the page is re-checked every few seconds until one shows up. */
+  function vendorOnPage(now) {
+    if (!heuristic.vendorOnPage && now - heuristic.vendorCheckedAt >= 5000) {
+      heuristic.vendorCheckedAt = now;
+      heuristic.vendorOnPage = hasVendorSource(document);
+    }
+    return heuristic.vendorOnPage;
+  }
+
+  function scoreCandidate(el, info, text, now) {
+    const signals = [];
+    const add = (name, fired) => { if (fired && W[name]) signals.push([name, W[name]]); };
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const box = layoutBox(el);
+    const r = box.getBoundingClientRect();
+    const coverage = viewportCoverage(box);
+    const atTop = r.top <= EDGE_PX;
+    const atBottom = r.bottom >= vh - EDGE_PX;
+    const inCorner = coverage < 0.25 && (r.left <= 60 || r.right >= vw - 60) && (r.top <= 60 || r.bottom >= vh - 60);
+    const centred = coverage >= 0.15 && coverage <= 0.8
+      && Math.abs((r.left + r.right) / 2 - vw / 2) < vw * 0.1 && Math.abs((r.top + r.bottom) / 2 - vh / 2) < vh * 0.2;
+    // Bars docked to the top count only when they appear late: at load they're usually site chrome.
+    const docked = coverage < 0.5 && (atBottom || inCorner || (atTop && !info.initial));
+    const soonAfter = (at) => at > 0 && info.firstSeen - at >= 0 && info.firstSeen - at <= CONFIG.HEURISTIC_TRIGGER_WINDOW_MS;
+    const age = info.firstSeen - heuristic.startedAt;
+
+    add('late', !info.initial);
+    add('trigger', (age >= 3000 && age <= 30000) || soonAfter(heuristic.scrollTriggerAt) || soonAfter(heuristic.exitIntentAt));
+    info.backdrop = findBackdrop(el);
+    add('backdrop', !!info.backdrop);
+    add('scrollLock', heuristic.locked && Math.abs(heuristic.lockedSince - info.firstSeen) <= CONFIG.HEURISTIC_TRIGGER_WINDOW_MS);
+    add('zIndex', parseInt(getComputedStyle(el).zIndex, 10) >= 1000);
+    add('placement', centred || docked);
+    add('emailInput', !!el.querySelector(EMAIL_INPUT_SELECTOR));
+    add('closeButton', !!findCloseButton(el));
+    add('annoyanceText', ANNOYANCE_RE.test(normalize(text.slice(0, 3000))));
+    const vendorInside = hasVendorSource(el);
+    add('vendor', vendorInside);
+    add('vendorOnPage', !vendorInside && vendorOnPage(now));
+    add('siteChrome', !!(el.closest(SITE_CHROME_SELECTOR) || el.querySelector(SITE_CHROME_SELECTOR)));
+    add('content', el.querySelectorAll('a[href]').length > 8 || text.trim().length > 600);
+    add('media', !!el.querySelector(MEDIA_SELECTOR));
+    add('otherInputs', !!el.querySelector(OTHER_INPUT_SELECTOR));
+    add('initialTopBar', info.initial && atTop && coverage < 0.5);
+    add('liveRegion', el.matches(LIVE_REGION_SELECTOR) || !!el.querySelector(LIVE_REGION_SELECTOR));
+
+    info.signals = signals;
+    info.score = signals.reduce((sum, [, w]) => sum + w, 0);
+  }
+
+  /** One line per candidate (again only if its score changes), with the signals that fired. */
+  function logCandidate(el, info) {
+    info.loggedScore = info.score;
+    if (heuristicActs && info.score < CONFIG.HEURISTIC_LOG_SCORE) return;
+    const verdict = info.score >= actScore ? (heuristicActs ? 'Heuristic match' : 'Heuristic would close')
+      : info.score >= CONFIG.HEURISTIC_LOG_SCORE ? 'Heuristic suspect' : 'Heuristic ignored';
+    const signals = info.signals.map(([name, w]) => `${w > 0 ? '+' : '−'}${Math.abs(w)} ${name}`).join(' ');
+    log(`${verdict} (score ${info.score}): ${describe(el)}\n    ${signals || 'no signals'}`, el);
+  }
+
+  function hideCandidate(el, info, reason) {
+    hideElement(el, reason);
+    if (info.backdrop && !el.contains(info.backdrop)) hideElement(info.backdrop, 'heuristic backdrop');
+    tracked.delete(el);
+  }
+
+  function handleHeuristic(now, containers) {
+    const t0 = performance.now();
+    const initialPass = now - heuristic.startedAt < INITIAL_WINDOW_MS;
+    updateScrollLock(now);
+
+    const candidates = findHeuristicCandidates();
+    for (const el of tracked) candidates.add(el);
+    for (const el of candidates) {
+      if (stopped) break;
+      if (el === document.body || !isVisible(el) || handledElsewhere(el, containers)) {
+        tracked.delete(el);
+        continue;
+      }
+
+      let info = heuristicInfo.get(el);
+      if (!info) {
+        info = { firstSeen: now, initial: initialPass, userInitiated: recentlyInteracted(now), dirty: true, loggedScore: null, clickedAt: 0 };
+        heuristicInfo.set(el, info);
+        if (info.userInitiated) {
+          userModals.add(el);
+          log('Ignoring user-opened dialog:', describe(el));
+        }
+      }
+      if (info.userInitiated) continue;
+      tracked.add(el);
+
+      if (info.clickedAt) {
+        if (now - info.clickedAt < CONFIG.RETRY_DELAY_MS) needRecheck = true;
+        else hideCandidate(el, info, 'heuristic popup still visible after close click');
+        continue;
+      }
+
+      if (info.dirty) {
+        info.dirty = false;
+        const text = el.innerText || '';
+        info.skip = notAnAnnoyance(el, text);
+        if (!info.skip) scoreCandidate(el, info, text, now);
+      }
+      if (info.skip) continue;
+      if (info.score !== info.loggedScore) logCandidate(el, info);
+      if (!heuristicActs || info.score < actScore) continue;
+
+      const close = findCloseButton(el);
+      if (close) {
+        clickElement(close.el, `heuristic close via ${close.how}, score ${info.score}`);
+        if (info.backdrop && !el.contains(info.backdrop)) hideElement(info.backdrop, 'heuristic backdrop');
+        info.clickedAt = now;
+        needRecheck = true;
+      } else if (now - info.firstSeen < CONFIG.HIDE_DELAY_MS) {
+        needRecheck = true; // let its buttons render first
+      } else {
+        hideCandidate(el, info, `heuristic annoyance, score ${info.score}`);
+      }
+    }
+
+    // Budget: under 2 ms per pass once warm (DevTools → Performance → Timings).
+    if (CONFIG.DEBUG) performance.measure('bs-closer heuristic', { start: t0, end: performance.now() });
+  }
+
+  /* ==========================================================================
    * STEP 4 — RESTORE SCROLLING
    * ======================================================================== */
   function restoreScroll(now) {
@@ -1072,11 +1408,13 @@
     try {
       handleFrameworks(now);
       if (isTop && !stopped) handleKnownAnnoyances();
-      for (const { el, type, floating } of findContainers()) {
+      const containers = findContainers();
+      for (const { el, type, floating } of containers) {
         if (stopped) break;
         if (type === 'consent') handleConsent(el, floating, now);
         else if (isTop) handlePopup(el, now); // popups in iframes are usually ads/widgets we can't judge
       }
+      if (heuristicOn && !stopped) handleHeuristic(now, containers);
       restoreScroll(now);
     } catch (err) {
       log('Scan error:', err);
@@ -1106,6 +1444,7 @@
     return;
   }
   if (isTop) log('Active.');
+  if (heuristicOn && actScore !== CONFIG.HEURISTIC_ACT_SCORE) log(`Heuristic act score for this site: ${actScore}.`);
   startAutoconsent();
 
   // Track genuine user interaction so dialogs the user opens are left alone.
@@ -1118,7 +1457,16 @@
 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleScan(); });
 
-  observer = new MutationObserver(() => scheduleScan());
+  // Popup triggers the heuristic looks for: scrolling past ~40 % and exit intent.
+  if (heuristicOn) {
+    window.addEventListener('scroll', onScrollDepth, { passive: true });
+    document.addEventListener('mouseout', onMouseOut, true);
+  }
+
+  observer = new MutationObserver((records) => {
+    if (heuristicOn) trackMutations(records);
+    scheduleScan();
+  });
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,

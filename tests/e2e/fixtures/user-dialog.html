@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>User-opened dialog</title>
+<style>
+  .sc-ud1 { position: fixed; inset: 0; z-index: 9999; background: rgba(0, 0, 0, .6); display: flex; align-items: center; justify-content: center; }
+  .sc-ud1 > div { width: 420px; padding: 32px; background: #fff; }
+</style>
+<body><h1>Article</h1>
+<button id="open">Get updates</button>
+<script src="fill.js"></script>
+<script>
+  // Opened by the user's own click, so BS Closer must leave it alone.
+  document.getElementById('open').addEventListener('click', () => popupLater(`
+    <div class="sc-ud1"><div>
+      <button data-close>×</button>
+      <h2>Subscribe to our newsletter</h2>
+      <input type="email" placeholder="Your email">
+    </div></div>`, 100));
+</script>

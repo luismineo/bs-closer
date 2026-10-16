@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8"><title>CSS-in-JS newsletter modal</title>
+<style>
+  .sc-nl7f2a { position: fixed; inset: 0; z-index: 9999; background: rgba(0, 0, 0, .6); display: flex; align-items: center; justify-content: center; }
+  .sc-b81kq { position: relative; width: 420px; padding: 32px; background: #fff; }
+  .sc-q2xw0 { position: absolute; top: 8px; right: 8px; border: 0; background: none; font-size: 20px; }
+</style>
+<body><h1>Article</h1>
+<script src="fill.js"></script>
+<script>
+  popupLater(`
+    <div class="sc-nl7f2a"><div class="sc-b81kq">
+      <button class="sc-q2xw0" data-close>×</button>
+      <h2>Get 10% off your first order</h2>
+      <p>Join thousands of happy readers.</p>
+      <input type="email" placeholder="Your email"> <button>Get my code</button>
+    </div></div>`, 3500, (el) => {
+    document.body.style.overflow = 'hidden';
+    el.querySelector('[data-close]').addEventListener('click', () => { document.body.style.overflow = ''; });
+  });
+</script>

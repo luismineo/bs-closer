@@ -1,0 +1,12 @@
+{
+  "name": "bs-closer-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end checks for BS Closer's heuristic: Playwright Chromium with the unpacked extension against local fixtures.",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.50.0"
+  }
+}
